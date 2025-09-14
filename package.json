@@ -1,0 +1,20 @@
+{
+  "name": "chatwork-bot",
+  "version": "1.0.0",
+  "description": "A Chatwork bot for various tasks.",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.45.1",
+    "axios": "^1.7.2",
+    "body-parser": "^1.20.2",
+    "compression": "^1.7.4",
+    "express": "^4.19.2",
+    "form-data": "^4.0.0",
+    "luxon": "^3.4.4",
+    "node-fetch": "^3.3.2",
+    "node-rest-client": "^3.1.1"
+  }
+}
