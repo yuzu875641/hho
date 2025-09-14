@@ -6,6 +6,8 @@ const { createClient } = require('@supabase/supabase-js');
 const { DateTime } = require('luxon');
 const axios = require('axios');
 const fs = require('fs');
+const FormData = require('form-data');
+const https = require('https');
 
 const PORT = process.env.PORT || 3000;
 
@@ -14,6 +16,7 @@ app.use(bodyParser.json());
 const CHATWORK_API_TOKEN = process.env.CHATWORK_API_TOKEN;
 const supabaseUrl = process.env.SUPABASE_URL;
 const supabaseKey = process.env.SUPABASE_KEY;
+const BOT_ACCOUNT_ID = '10617115'; // BotのIDを直接設定
 const supabase = createClient(supabaseUrl, supabaseKey);
 
 const zalgoPattern = /[\u0300-\u036F\u1AB0-\u1AFF\u1DC0-\u1DFF\u20D0-\u20FF\uFE20-\uFE2F]/;
@@ -32,37 +35,45 @@ const commands = {
   "adminlist": gijiAdminList,
   "kick": kickMember,
   "welcome": welcomesave,
-  "welcomedelete": welcomedelete
+  "welcomedelete": welcomedelete,
+  "削除": deleteMessages,
+  "ars": arasitaisaku,
+  "retrust": retrust
 };
 
 app.get("/", (req, res) => {
   res.status(200).json({ status: "ok" });
 });
 
-app.post("/webhook", (req, res) => {
+app.post("/webhook", async (req, res) => {
   res.sendStatus(200);
   const data = req.body;
-  if (data.webhook_setting_id) {
-    console.log("Webhook test successful.");
-    return;
-  }
   const messageBody = data.webhook_event.body;
   const roomId = data.webhook_event.room_id;
   const messageId = data.webhook_event.message_id;
   const accountId = data.webhook_event.account_id;
-  const name = data.webhook_event.pname;
 
+  if (accountId.toString() === BOT_ACCOUNT_ID) {
+    return;
+  }
+
+  if (data.webhook_setting_id) {
+    console.log("Webhook test successful.");
+    return;
+  }
+  
   if (zalgoPattern.test(messageBody)) {
     kick(roomId, accountId);
     return;
   }
 
-  const match = messageBody.match(/\/(\w+)\//);
+  const cleanMessageBody = messageBody.replace(/^\[To:\d+\]さん\n/, '');
+  const match = cleanMessageBody.match(/\/(\w+)\//);
   if (match) {
     const commandName = match[1];
     const command = commands[commandName];
     if (command) {
-      command(roomId, messageId, messageBody.split(" ").slice(1).join(" "), accountId);
+      await command(cleanMessageBody, cleanMessageBody.replace(/\//g, ''), messageId, roomId, accountId);
     } else {
       sendMessageToChatwork(roomId, messageId, "存在しないコマンドです", accountId);
     }
@@ -72,15 +83,20 @@ app.post("/webhook", (req, res) => {
 app.post("/getchat", async (req, res) => {
   res.sendStatus(200);
   const data = req.body;
-  if (data.webhook_setting_id) {
-    console.log("Webhook test successful.");
-    return;
-  }
   const roomId = data.webhook_event.room_id;
   const accountId = data.webhook_event.account_id;
   const messageBody = data.webhook_event.body;
   const messageId = data.webhook_event.message_id;
+  
+  if (accountId.toString() === BOT_ACCOUNT_ID) {
+    return;
+  }
 
+  if (data.webhook_setting_id) {
+    console.log("Webhook test successful.");
+    return;
+  }
+  
   if (zalgoPattern.test(messageBody)) {
     kick(roomId, accountId);
     return;
@@ -101,6 +117,7 @@ app.post("/getchat", async (req, res) => {
         }
       }
     }
+    
     if (messageBody.includes("おみくじ")) {
       const { data: omikujiLog, error } = await supabase
         .from('omikuji_log')
@@ -110,7 +127,7 @@ app.post("/getchat", async (req, res) => {
         .gte('date', DateTime.now().setZone('Asia/Tokyo').startOf('day').toISODate());
       if (error) throw error;
       if (omikujiLog.length === 0) {
-        komikuji(roomId, messageId, "", accountId);
+        komikuji(messageBody, "", messageId, roomId, accountId);
         const { error: insertError } = await supabase
           .from('omikuji_log')
           .insert([{ roomid: roomId, accountid: accountId, date: DateTime.now().setZone('Asia/Tokyo').toISODate() }]);
@@ -128,10 +145,10 @@ app.listen(PORT, () => {
   console.log(`Server is running on port ${PORT}`);
 });
 
-async function wakamehelp(roomId, messageId, args, accountId) {
+async function wakamehelp(body, message, messageId, roomId, accountId) {
   const helpMessage = `
 ---
-ワカメbotのコマンドリスト
+ゆずbotのコマンドリスト
 ---
 \`\`\`
 /help/  - このコマンドリストを表示
@@ -148,6 +165,9 @@ async function wakamehelp(roomId, messageId, args, accountId) {
 /kick/ [アカウントID] - ユーザーを閲覧のみの権限に変更
 /welcome/ [メッセージ] - 新規参加者へのメッセージを保存
 /welcomedelete/ - 新規参加者へのメッセージを削除
+/削除/ - 過去のメッセージを削除します
+/ars/ - 荒らし対策フィルターのON/OFF
+/retrust/ - 閲覧のみユーザーを元に戻します
 \`\`\`
   `;
   await sendMessageToChatwork(roomId, messageId, helpMessage, accountId);
@@ -155,31 +175,46 @@ async function wakamehelp(roomId, messageId, args, accountId) {
 
 async function isUserAdmin(accountId, roomId) {
   try {
-    const { data: adminData, error: adminError } = await supabase
-      .from('room_admins')
-      .select('accountid')
-      .eq('roomid', roomId)
-      .eq('accountid', accountId);
-
-    if (adminError) throw adminError;
-    return adminData && adminData.length > 0;
+    const response = await axios.get(`https://api.chatwork.com/v2/rooms/${roomId}/members`, {
+      headers: {
+        'X-ChatWorkToken': CHATWORK_API_TOKEN
+      }
+    });
+    const member = response.data.find(m => m.account_id === accountId);
+    return member && member.role === 'admin';
   } catch (error) {
-    console.error("管理者チェックエラー:", error.message);
+    console.error('管理者チェックエラー:', error);
     return false;
   }
 }
 
-async function checkAdmin(roomId, accountId, messageId) {
+async function checkGijiAdmin(roomId, accountId) {
+  try {
+    const { data, error } = await supabase
+      .from('room_admins')
+      .select('accountid')
+      .eq('roomid', roomId)
+      .eq('accountid', accountId)
+      .single();
+    return !!data;
+  } catch (error) {
+    console.error("擬似管理者チェックエラー:", error.message);
+    return false;
+  }
+}
+
+async function checkPermission(roomId, accountId, messageId) {
   const isAdmin = await isUserAdmin(accountId, roomId);
-  if (!isAdmin) {
-    await sendMessageToChatwork(roomId, messageId, "管理者権限がありません", accountId);
+  const isGijiAdmin = await checkGijiAdmin(roomId, accountId);
+  if (!isAdmin && !isGijiAdmin) {
+    await sendMessageToChatwork(roomId, messageId, "管理者または擬似管理者権限がありません", accountId);
     return false;
   }
   return true;
 }
 
-async function addAdmin(roomId, messageId, args, accountId) {
-  if (!await checkAdmin(roomId, accountId, messageId)) return;
+async function addAdmin(body, args, messageId, roomId, accountId) {
+  if (!await checkPermission(roomId, accountId, messageId)) return;
   const targetAccountId = args;
   if (!targetAccountId) {
     sendMessageToChatwork(roomId, messageId, "アカウントIDを指定してください", accountId);
@@ -207,15 +242,15 @@ async function addAdmin(roomId, messageId, args, accountId) {
   }
 }
 
-async function removeAdmin(roomId, messageId, args, accountId) {
-  if (!await checkAdmin(roomId, accountId, messageId)) return;
+async function removeAdmin(body, args, messageId, roomId, accountId) {
+  if (!await checkPermission(roomId, accountId, messageId)) return;
   const targetAccountId = args;
   if (!targetAccountId) {
     sendMessageToChatwork(roomId, messageId, "アカウントIDを指定してください", accountId);
     return;
   }
   try {
-    const { data, error: deleteError } = await supabase
+    const { error: deleteError } = await supabase
       .from('room_admins')
       .delete()
       .eq('roomid', roomId)
@@ -228,8 +263,8 @@ async function removeAdmin(roomId, messageId, args, accountId) {
   }
 }
 
-async function gijiAdminList(roomId, messageId, args, accountId) {
-  if (!await checkAdmin(roomId, accountId, messageId)) return;
+async function gijiAdminList(body, args, messageId, roomId, accountId) {
+  if (!await checkPermission(roomId, accountId, messageId)) return;
   try {
     const { data, error } = await supabase
       .from('room_admins')
@@ -248,8 +283,8 @@ async function gijiAdminList(roomId, messageId, args, accountId) {
   }
 }
 
-async function kickMember(roomId, messageId, args, accountId) {
-  if (!await checkAdmin(roomId, accountId, messageId)) return;
+async function kickMember(body, args, messageId, roomId, accountId) {
+  if (!await checkPermission(roomId, accountId, messageId)) return;
   const targetAccountId = args;
   if (!targetAccountId) {
     sendMessageToChatwork(roomId, messageId, "アカウントIDを指定してください", accountId);
@@ -273,8 +308,8 @@ async function kickMember(roomId, messageId, args, accountId) {
   }
 }
 
-async function say(roomId, messageId, args, accountId) {
-  const message = args;
+async function say(body, args, messageId, roomId, accountId) {
+  const message = args.trim();
   if (!message) {
     sendMessageToChatwork(roomId, messageId, "メッセージを入力してください", accountId);
     return;
@@ -282,14 +317,14 @@ async function say(roomId, messageId, args, accountId) {
   sendMessageToChatwork(roomId, messageId, message, accountId);
 }
 
-async function komikuji(roomId, messageId, args, accountId) {
+async function komikuji(body, args, messageId, roomId, accountId) {
   const omikujiList = ["大吉", "吉", "中吉", "小吉", "末吉", "凶", "大凶"];
   const result = omikujiList[Math.floor(Math.random() * omikujiList.length)];
   sendMessageToChatwork(roomId, messageId, `おみくじの結果は...${result}でした！`, accountId);
 }
 
-async function save(roomId, messageId, args, accountId) {
-  if (!await checkAdmin(roomId, accountId, messageId)) return;
+async function save(body, args, messageId, roomId, accountId) {
+  if (!await checkPermission(roomId, accountId, messageId)) return;
   const [triggerMessage, ...responseParts] = args.split(" ");
   const responseMessage = responseParts.join(" ");
   if (!triggerMessage || !responseMessage) {
@@ -308,15 +343,15 @@ async function save(roomId, messageId, args, accountId) {
   }
 }
 
-async function deleteData(roomId, messageId, args, accountId) {
-  if (!await checkAdmin(roomId, accountId, messageId)) return;
-  const triggerMessage = args;
+async function deleteData(body, args, messageId, roomId, accountId) {
+  if (!await checkPermission(roomId, accountId, messageId)) return;
+  const triggerMessage = args.trim();
   if (!triggerMessage) {
     sendMessageToChatwork(roomId, messageId, "削除するトリガーを指定してください", accountId);
     return;
   }
   try {
-    const { data, error: deleteError } = await supabase
+    const { error: deleteError } = await supabase
       .from('text')
       .delete()
       .eq('roomid', roomId)
@@ -329,8 +364,8 @@ async function deleteData(roomId, messageId, args, accountId) {
   }
 }
 
-async function Settings(roomId, messageId, args, accountId) {
-  if (!await checkAdmin(roomId, accountId, messageId)) return;
+async function Settings(body, args, messageId, roomId, accountId) {
+  if (!await checkPermission(roomId, accountId, messageId)) return;
   try {
     const { data, error } = await supabase
       .from('text')
@@ -349,7 +384,7 @@ async function Settings(roomId, messageId, args, accountId) {
   }
 }
 
-async function RandomMember(roomId, messageId, args, accountId) {
+async function RandomMember(body, args, messageId, roomId, accountId) {
   try {
     const { data } = await axios.get(`https://api.chatwork.com/v2/rooms/${roomId}/members`, {
       headers: { "X-ChatWorkToken": CHATWORK_API_TOKEN },
@@ -363,7 +398,7 @@ async function RandomMember(roomId, messageId, args, accountId) {
   }
 }
 
-async function sendFile(roomId, messageId, args, accountId) {
+async function sendFile(body, args, messageId, roomId, accountId) {
   const imageUrl = "https://picsum.photos/400";
   const fileName = "random_image.jpg";
   const filePath = `./${fileName}`;
@@ -390,7 +425,7 @@ async function sendFile(roomId, messageId, args, accountId) {
       "X-ChatWorkToken": CHATWORK_API_TOKEN,
     };
 
-    const res = await axios.post(uploadUrl, formData, { headers });
+    await axios.post(uploadUrl, formData, { headers });
     fs.unlinkSync(filePath);
     sendMessageToChatwork(roomId, messageId, "画像を送信しました！", accountId);
 
@@ -421,8 +456,8 @@ async function kick(roomId, accountId) {
   }
 }
 
-async function welcomesave(roomId, messageId, args, accountId) {
-  if (!await checkAdmin(roomId, accountId, messageId)) return;
+async function welcomesave(body, args, messageId, roomId, accountId) {
+  if (!await checkPermission(roomId, accountId, messageId)) return;
   const welcomems = args;
   if (!welcomems) {
     sendMessageToChatwork(roomId, messageId, "メッセージを入力してください", accountId);
@@ -434,6 +469,8 @@ async function welcomesave(roomId, messageId, args, accountId) {
       .select('welcomems')
       .eq('roomid', roomId)
       .single();
+    if (selectError && selectError.code !== 'PGRST116') throw selectError; 
+    
     if (existingWelcome) {
       const { error: updateError } = await supabase
         .from('welcome')
@@ -454,10 +491,10 @@ async function welcomesave(roomId, messageId, args, accountId) {
   }
 }
 
-async function welcomedelete(roomId, messageId, args, accountId) {
-  if (!await checkAdmin(roomId, accountId, messageId)) return;
+async function welcomedelete(body, args, messageId, roomId, accountId) {
+  if (!await checkPermission(roomId, accountId, messageId)) return;
   try {
-    const { data, error: deleteError } = await supabase
+    const { error: deleteError } = await supabase
       .from('welcome')
       .delete()
       .eq('roomid', roomId);
@@ -471,7 +508,7 @@ async function welcomedelete(roomId, messageId, args, accountId) {
 
 async function sendMessageToChatwork(roomId, messageId, message, accountId) {
   try {
-    const ms = `[rp aid=${accountId} to=${roomId}-${messageId}][pname:${accountId}]さん\\n${message}`;
+    const ms = `[rp aid=${accountId} to=${roomId}-${messageId}][pname:${accountId}]さん\n${message}`;
     await axios.post(
       `https://api.chatwork.com/v2/rooms/${roomId}/messages`,
       new URLSearchParams({ body: ms }),
@@ -486,4 +523,134 @@ async function sendMessageToChatwork(roomId, messageId, message, accountId) {
   } catch (error) {
     console.error("Chatworkへのメッセージ送信エラー:", error.response?.data || error.message);
   }
-        }
+}
+async function getChatworkMembers(roomId) {
+  try {
+    const response = await axios.get(
+      `https://api.chatwork.com/v2/rooms/${roomId}/members`,
+      {
+        headers: {
+          "X-ChatWorkToken": CHATWORK_API_TOKEN,
+        },
+      }
+    );
+    return response.data;
+  } catch (error) {
+    console.error(
+      "Error fetching Chatwork members:",
+      error.response?.data || error.message
+    );
+    return null;
+  }
+}
+
+async function deleteMessages(body, message, messageId, roomId, accountId) {
+  const isGijiAdmin = await checkGijiAdmin(roomId, accountId);
+  const isAdmin = await isUserAdmin(accountId, roomId);
+  if (!isGijiAdmin && !isAdmin) {
+    sendMessageToChatwork(roomId, messageId, "管理者権限がありません", accountId);
+    return;
+  }
+
+  const dlmessageIds = body.match(/(?<=to=\d+-)(\d+)/g);
+  if (!dlmessageIds) {
+    sendMessageToChatwork(roomId, messageId, "削除するメッセージを指定してください。", accountId);
+    return;
+  }
+
+  for (const msgId of dlmessageIds) {
+    try {
+      await axios.delete(`https://api.chatwork.com/v2/rooms/${roomId}/messages/${msgId}`, {
+        headers: {
+          'x-chatworktoken': CHATWORK_API_TOKEN,
+        },
+      });
+      console.log(`メッセージID ${msgId} を削除しました。`);
+    } catch (err) {
+      console.error(`メッセージID ${msgId} の削除に失敗しました:`, err.response?.data || err.message);
+      sendMessageToChatwork(roomId, messageId, `メッセージID ${msgId} の削除に失敗しました。`, accountId);
+    }
+  }
+  sendMessageToChatwork(roomId, messageId, "指定されたメッセージの削除を試行しました。", accountId);
+}
+async function arasitaisaku(body, message, messageId, roomId, accountId) {
+  const isGijiAdmin = await checkGijiAdmin(roomId, accountId);
+  const isAdmin = await isUserAdmin(accountId, roomId);
+  if (!isGijiAdmin && !isAdmin) {
+    sendMessageToChatwork(roomId, messageId, "管理者権限がありません", accountId);
+    return;
+  }
+  try {
+    const { data, error } = await supabase
+      .from('arashi_rooms')
+      .select('roomid')
+      .eq('roomid', roomId);
+    if (error) throw error;
+    if (data.length === 0) {
+      const { error: insertError } = await supabase
+        .from('arashi_rooms')
+        .insert([{ roomid: roomId }]);
+      if (insertError) throw insertError;
+      sendMessageToChatwork(roomId, messageId, "荒らし対策フィルターをONにしました。", accountId);
+    } else {
+      const { error: deleteError } = await supabase
+        .from('arashi_rooms')
+        .delete()
+        .eq('roomid', roomId);
+      if (deleteError) throw deleteError;
+      sendMessageToChatwork(roomId, messageId, "荒らし対策フィルターをOFFにしました。", accountId);
+    }
+  } catch (err) {
+    console.error('荒らし対策設定エラー:', err);
+    sendMessageToChatwork(roomId, messageId, "荒らし対策設定中にエラーが発生しました。",accountId);
+    }
+  } catch (err) {
+    console.error('荒らし対策設定エラー:', err);
+    sendMessageToChatwork(roomId, messageId, "荒らし対策設定中にエラーが発生しました。", accountId);
+  }
+}
+async function retrust(body, message, messageId, roomId, accountId) {
+  const isGijiAdmin = await checkGijiAdmin(roomId, accountId);
+  const isAdmin = await isUserAdmin(accountId, roomId);
+  if (!isGijiAdmin && !isAdmin) {
+    sendMessageToChatwork(roomId, messageId, "管理者権限がありません", accountId);
+    return;
+  }
+
+  const targetAccountId = message;
+  if (!targetAccountId) {
+    sendMessageToChatwork(roomId, messageId, "アカウントIDを指定してください", accountId);
+    return;
+  }
+
+  try {
+    const members = await getChatworkMembers(roomId);
+    let adminIds = members.filter(m => m.role === 'admin').map(m => m.account_id);
+    let memberIds = members.filter(m => m.role === 'member').map(m => m.account_id);
+    let readonlyIds = members.filter(m => m.role === 'readonly').map(m => m.account_id);
+    
+    if (readonlyIds.includes(parseInt(targetAccountId))) {
+      memberIds.push(parseInt(targetAccountId));
+      readonlyIds = readonlyIds.filter(id => id !== parseInt(targetAccountId));
+      
+      const encodedParams = new URLSearchParams();
+      encodedParams.set('members_admin_ids', adminIds.join(','));
+      encodedParams.set('members_member_ids', memberIds.join(','));
+      encodedParams.set('members_readonly_ids', readonlyIds.join(','));
+
+      const url = `https://api.chatwork.com/v2/rooms/${roomId}/members`;
+      await axios.put(url, encodedParams.toString(), {
+        headers: {
+          'Content-Type': 'application/x-www-form-urlencoded',
+          'x-chatworktoken': CHATWORK_API_TOKEN,
+        },
+      });
+      sendMessageToChatwork(roomId, messageId, `アカウントID ${targetAccountId} の権限を戻しました。`, accountId);
+    } else {
+      sendMessageToChatwork(roomId, messageId, `アカウントID ${targetAccountId} は閲覧のみではありません。`, accountId);
+    }
+  } catch (error) {
+    console.error("権限変更エラー:", error.response?.data || error.message);
+    sendMessageToChatwork(roomId, messageId, "権限変更中にエラーが発生しました。", accountId);
+  }
+}
